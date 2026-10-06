@@ -277,6 +277,23 @@ fn mapped_device_is_gamepad(mapped: bool, force_feedback_wheel: bool) -> bool {
     mapped && !force_feedback_wheel
 }
 
+/// A gamepad stick's dead zone: nothing round its centre, then the rest of the way from
+/// nothing - it used to cut off below 0.08 and jump straight to 0.08 past it.
+pub(crate) fn stick_deadzone(x: f32) -> f32 {
+    const DEAD: f32 = 0.08;
+    if x.abs() <= DEAD { 0.0 } else { x.signum() * ((x.abs() - DEAD) / (1.0 - DEAD)).min(1.0) }
+}
+
+/// `current` eased towards `target` over a time constant `tau` (s), the same whatever the
+/// frame rate; `tau` 0 is the target at once. A stick's few hundredths of wobble round
+/// where the thumb rests went into the bus's curvature frame by frame.
+pub fn smooth_toward(current: f32, target: f32, dt: f32, tau: f32) -> f32 {
+    if tau <= 0.0 || !current.is_finite() {
+        return target;
+    }
+    current + (target - current) * (1.0 - (-dt.max(0.0) / tau).exp())
+}
+
 /// Bus steering follows its characteristic, dead zone and range; feedback follows the physical
 /// wheel position, so it can keep returning even inside the input dead zone.
 fn wheel_steering(axis: f32, reversed: bool, flags: i32, deadzone: f32, gain: f32) -> (f32, f32) {
@@ -1232,8 +1249,7 @@ impl Controllers {
                     continue;
                 }
                 let x = pad.value(Axis::LeftStickX);
-                let dead = |v: f32| if v.abs() < 0.08 { 0.0 } else { v };
-                let steers = stick_steers(out.steering, steering_set_up, dead(x));
+                let steers = stick_steers(out.steering, steering_set_up, stick_deadzone(x));
                 // (said once per pad: the stick moved, and whether it steers - a report of
                 // "the sticks do nothing" then says which way the pad came in)
                 if x.abs() > 0.5 && !self.announced.iter().any(|n| n == &format!("stick:{}", pad.name())) {
@@ -1243,7 +1259,7 @@ impl Controllers {
                 let rt = pad.button_data(gilrs::Button::RightTrigger2).map(|d| d.value()).unwrap_or(0.0);
                 let lt = pad.button_data(gilrs::Button::LeftTrigger2).map(|d| d.value()).unwrap_or(0.0);
                 if steers {
-                    out.steering = Some(dead(x));
+                    out.steering = Some(stick_deadzone(x));
                     out.stick = true;
                 }
                 out.throttle.get_or_insert(crate::settings::pedal_curve(rt, self.pedal_throttle));
@@ -1835,6 +1851,34 @@ mod tests {
         assert!(is_claimed_by_di("Logitech G29 Driving Force Racing Wheel", true));
         assert!(is_claimed_by_di("HORI Racing Wheel APEX", false));
         assert!(is_claimed_by_di("G920 Driving Force Racing Wheel for Xbox One", true));
+    }
+
+    #[test]
+    fn a_stick_leaves_its_dead_zone_from_nothing() {
+        use super::stick_deadzone;
+        assert_eq!(stick_deadzone(0.05), 0.0);
+        assert_eq!(stick_deadzone(-0.08), 0.0);
+        assert!(stick_deadzone(0.0801) < 0.001);
+        assert!((stick_deadzone(1.0) - 1.0).abs() < 1e-6);
+        assert!((stick_deadzone(-1.0) + 1.0).abs() < 1e-6);
+        assert!(stick_deadzone(-0.5) < 0.0);
+    }
+
+    #[test]
+    fn stick_steering_is_smoothed_at_any_frame_rate() {
+        use super::smooth_toward;
+        assert_eq!(smooth_toward(0.0, 0.7, 0.016, 0.0), 0.7);
+        // never past the target
+        assert!(smooth_toward(0.0, 0.5, 1.0, 0.12) <= 0.5);
+        // two 8 ms frames land where one 16 ms frame does
+        let twice = smooth_toward(smooth_toward(0.0, 1.0, 0.008, 0.12), 1.0, 0.008, 0.12);
+        assert!((twice - smooth_toward(0.0, 1.0, 0.016, 0.12)).abs() < 1e-5);
+        // a stick wobbling 0.03 either side of 0.2 every frame: the wheel holds near 0.2
+        let mut v = 0.2;
+        for i in 0..240 {
+            v = smooth_toward(v, if i % 2 == 0 { 0.23 } else { 0.17 }, 1.0 / 60.0, 0.12);
+        }
+        assert!((v - 0.2).abs() < 0.01, "{v}");
     }
 
     #[test]
