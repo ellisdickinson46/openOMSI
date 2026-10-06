@@ -345,6 +345,10 @@ pub(crate) struct Devices {
     hid: Option<crate::mac_hid::MacHid>,
     #[cfg(target_os = "macos")]
     hid_axes: Vec<(String, Vec<(u32, f32)>)>,
+    /// macOS: Xbox-type controllers, which gilrs and `hid` cannot read at all (see
+    /// `mac_game_controller`).
+    #[cfg(target_os = "macos")]
+    gc: crate::mac_game_controller::GcPads,
     #[cfg(target_os = "linux")]
     hats: Vec<(String, [i8; 8])>,
 }
@@ -383,6 +387,8 @@ impl Devices {
             hid: crate::mac_hid::MacHid::new(),
             #[cfg(target_os = "macos")]
             hid_axes: Vec::new(),
+            #[cfg(target_os = "macos")]
+            gc: crate::mac_game_controller::GcPads::new(),
             #[cfg(target_os = "linux")]
             hats: Vec::new(),
         }
@@ -536,6 +542,8 @@ impl Devices {
         if let Some(h) = self.hid.as_mut() {
             self.hid_axes = h.read();
         }
+        #[cfg(target_os = "macos")]
+        out.extend(self.gc.poll());
         #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
         self.button_devices.poll(&mut out);
         out
@@ -623,6 +631,17 @@ impl Devices {
         for (name, axes) in &self.hid_axes {
             if !v.iter().any(|c| names_match(&c.name, name)) {
                 v.push(Connected { name: name.clone(), hardware_id: None, axes: di_slots(axes), gamepad: false, ff: false, ff_capable: false, buttons: 0 });
+            }
+        }
+        // (an Xbox-type controller: gilrs lists it too, as a generic "Controller" with no
+        // axis or button at all - Apple's own driver leaves nothing else for it to read.
+        // That name is left in the list too: it fuzzy-matches this one's by `names_match`
+        // - "Controller" is a substring of "Xbox Controller" - and would otherwise look
+        // like this device already had a usable entry and lose it)
+        #[cfg(target_os = "macos")]
+        for (name, axes) in self.gc.connected() {
+            if !v.iter().any(|c| c.name == name) {
+                v.push(Connected { name, hardware_id: None, axes, gamepad: true, ff: false, ff_capable: false, buttons: 0 });
             }
         }
         #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
@@ -1268,6 +1287,28 @@ impl Controllers {
                 out.apply_default_gamepad_look(self.right_stick_look, pad.value(Axis::RightStickX), pad.value(Axis::RightStickY));
             }
         }
+        // macOS: Xbox-type controllers, read through the GameController framework and so
+        // never gilrs's pads above - the same default layout all the same
+        #[cfg(target_os = "macos")]
+        for (name, axes) in self.devices.gc.connected() {
+            if custom_gamepad_axes(&self.cfg, &name) || off.iter().any(|d| names_match(d, &name)) {
+                continue;
+            }
+            let axis = |k: usize| axes.iter().find(|(c, _)| *c == k).map_or(0.0, |(_, v)| *v);
+            let x = axis(0);
+            let steers = stick_steers(out.steering, steering_set_up, stick_deadzone(x));
+            if x.abs() > 0.5 && !self.announced.iter().any(|n| n == &format!("stick:{name}")) {
+                self.announced.push(format!("stick:{name}"));
+                log::info!("game controller {name}: left stick {x:.2}, steers: {steers}");
+            }
+            if steers {
+                out.steering = Some(stick_deadzone(x));
+                out.stick = true;
+            }
+            out.throttle.get_or_insert(crate::settings::pedal_curve((axis(4) + 1.0) / 2.0, self.pedal_throttle));
+            out.brake.get_or_insert(crate::settings::pedal_curve((axis(5) + 1.0) / 2.0, self.pedal_brake));
+            out.apply_default_gamepad_look(self.right_stick_look, axis(2), axis(3));
+        }
         let before = self.steer.as_ref().filter(|s| steer.as_ref().is_some_and(|n| n.0 == s.0)).map(|s| s.1);
         self.steer = steer.map(|(name, v, ff)| (name, v, before.unwrap_or(v), ff));
         out
@@ -1611,6 +1652,13 @@ pub(crate) fn names_match(a: &str, b: &str) -> bool {
     // matched nothing)
     let (a, b) = (normalized_device_name(a), normalized_device_name(b));
     !a.is_empty() && (a == b || a.contains(&b) || b.contains(&a))
+}
+
+/// The connected device this name is set up as - its exact name first: an Xbox-type pad's
+/// gilrs lists too, as a plain "Controller" with no axis or button at all (see
+/// `mac_game_controller`), and that name is a substring of (so fuzzy-matches) this device's.
+pub(crate) fn find_connected<'a>(connected: &'a [Connected], name: &str) -> Option<&'a Connected> {
+    connected.iter().find(|c| c.name == name).or_else(|| connected.iter().find(|c| names_match(&c.name, name)))
 }
 
 /// An exact device name wins over a shorter alias elsewhere in the same OMSI file.
@@ -2726,6 +2774,8 @@ mod hot_reload_tests {
             hid: None,
             #[cfg(target_os = "macos")]
             hid_axes: Vec::new(),
+            #[cfg(target_os = "macos")]
+            gc: crate::mac_game_controller::GcPads::new(),
             #[cfg(target_os = "linux")]
             hats: Vec::new(),
         }

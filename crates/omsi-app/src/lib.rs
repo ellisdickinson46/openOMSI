@@ -20,6 +20,8 @@ mod headtrack;
 mod openxr;
 #[cfg(target_os = "macos")]
 mod mac_hid;
+#[cfg(target_os = "macos")]
+mod mac_game_controller;
 #[cfg(target_os = "android")]
 mod android;
 mod platform;
