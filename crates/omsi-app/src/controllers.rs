@@ -340,6 +340,10 @@ pub(crate) struct Devices {
     button_devices: crate::evdev_buttons::ButtonDevices,
     #[cfg(windows)]
     di: Option<crate::dinput::DirectInput>,
+    /// macOS: Xbox-type controllers, which gilrs and `hid` cannot read at all (see
+    /// `mac_game_controller`).
+    #[cfg(target_os = "macos")]
+    gc: crate::mac_game_controller::GcPads,
     /// macOS: every axis element of every wheel and joystick, as last read (see `mac_hid`)
     #[cfg(target_os = "macos")]
     hid: Option<crate::mac_hid::MacHid>,
@@ -379,6 +383,8 @@ impl Devices {
             button_devices: crate::evdev_buttons::ButtonDevices::new(),
             #[cfg(windows)]
             di,
+            #[cfg(target_os = "macos")]
+            gc: crate::mac_game_controller::GcPads::new(),
             #[cfg(target_os = "macos")]
             hid: crate::mac_hid::MacHid::new(),
             #[cfg(target_os = "macos")]
@@ -536,6 +542,8 @@ impl Devices {
         if let Some(h) = self.hid.as_mut() {
             self.hid_axes = h.read();
         }
+        #[cfg(target_os = "macos")]
+        out.extend(self.gc.poll());
         #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
         self.button_devices.poll(&mut out);
         out
@@ -623,6 +631,17 @@ impl Devices {
         for (name, axes) in &self.hid_axes {
             if !v.iter().any(|c| names_match(&c.name, name)) {
                 v.push(Connected { name: name.clone(), hardware_id: None, axes: di_slots(axes), gamepad: false, ff: false, ff_capable: false, buttons: 0 });
+            }
+        }
+        // (an Xbox-type controller: gilrs lists it too, as a generic "Controller" with no
+        // axis or button at all - Apple's own driver leaves nothing else for it to read.
+        // That name is left in the list too: it fuzzy-matches this one's by `names_match`
+        // - "Controller" is a substring of "Xbox Controller" - and would otherwise look
+        // like this device already had a usable entry and lose it)
+        #[cfg(target_os = "macos")]
+        for (name, axes) in self.gc.connected() {
+            if !v.iter().any(|c| c.name == name) {
+                v.push(Connected { name, hardware_id: None, axes, gamepad: true, ff: false, ff_capable: false, buttons: 0 });
             }
         }
         #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
@@ -1268,6 +1287,28 @@ impl Controllers {
                 out.apply_default_gamepad_look(self.right_stick_look, pad.value(Axis::RightStickX), pad.value(Axis::RightStickY));
             }
         }
+        // macOS: Xbox-type controllers, read through the GameController framework and so
+        // never gilrs's pads above - the same default layout all the same
+        #[cfg(target_os = "macos")]
+        for (name, axes) in self.devices.gc.connected() {
+            if custom_gamepad_axes(&self.cfg, &name) || off.iter().any(|d| names_match(d, &name)) {
+                continue;
+            }
+            let axis = |k: usize| axes.iter().find(|(c, _)| *c == k).map_or(0.0, |(_, v)| *v);
+            let x = axis(0);
+            let steers = stick_steers(out.steering, steering_set_up, stick_deadzone(x));
+            if x.abs() > 0.5 && !self.announced.iter().any(|n| n == &format!("stick:{name}")) {
+                self.announced.push(format!("stick:{name}"));
+                log::info!("game controller {name}: left stick {x:.2}, steers: {steers}");
+            }
+            if steers {
+                out.steering = Some(stick_deadzone(x));
+                out.stick = true;
+            }
+            out.throttle.get_or_insert(crate::settings::pedal_curve((axis(4) + 1.0) / 2.0, self.pedal_throttle));
+            out.brake.get_or_insert(crate::settings::pedal_curve((axis(5) + 1.0) / 2.0, self.pedal_brake));
+            out.apply_default_gamepad_look(self.right_stick_look, axis(2), axis(3));
+        }
         let before = self.steer.as_ref().filter(|s| steer.as_ref().is_some_and(|n| n.0 == s.0)).map(|s| s.1);
         self.steer = steer.map(|(name, v, ff)| (name, v, before.unwrap_or(v), ff));
         out
@@ -1613,6 +1654,13 @@ pub(crate) fn names_match(a: &str, b: &str) -> bool {
     !a.is_empty() && (a == b || a.contains(&b) || b.contains(&a))
 }
 
+/// The connected device this name is set up as - its exact name first: an Xbox-type pad's
+/// gilrs lists too, as a plain "Controller" with no axis or button at all (see
+/// `mac_game_controller`), and that name is a substring of (so fuzzy-matches) this device's.
+pub(crate) fn find_connected<'a>(connected: &'a [Connected], name: &str) -> Option<&'a Connected> {
+    connected.iter().find(|c| c.name == name).or_else(|| connected.iter().find(|c| names_match(&c.name, name)))
+}
+
 /// An exact device name wins over a shorter alias elsewhere in the same OMSI file.
 fn find_device_cfg<'a>(cfg: &'a [DeviceCfg], name: &str) -> Option<&'a DeviceCfg> {
     let exact = normalized_device_name(name);
@@ -1826,32 +1874,6 @@ mod tests {
         assert_eq!(super::look_axis(-1.0), -1.0);
         assert!(super::look_axis(0.5) > 0.4 && super::look_axis(0.5) < 0.5);
     }
-    #[test]
-    fn names() {
-        assert!(super::names_match("Logitech G25 Racing Wheel USB", "Logitech G25 Racing Wheel"));
-        assert!(!super::names_match("", "x"));
-        assert!(super::names_match("Кнопочная панель", "кнопочная  панель"));
-        assert!(!super::names_match("Кнопочная панель", "Руль"));
-    }
-
-    #[test]
-    fn an_xbox_named_ff_wheel_stays_visible_in_the_launcher() {
-        assert!(super::include_direct_input_device("G920 Driving Force Racing Wheel for Xbox One", true, true));
-        assert!(!super::include_direct_input_device("Controller (Xbox One)", false, true));
-    }
-
-    #[test]
-    fn xbox_gamepad_with_direct_input_twin_is_not_claimed_by_direct_input() {
-        let xinput_pads = true;
-        let is_claimed_by_di = |name: &str, ff_capable: bool| {
-            super::include_direct_input_device(name, ff_capable, xinput_pads)
-        };
-        assert!(!is_claimed_by_di("Controller (XBOX 360 For Windows)", false));
-        assert!(!is_claimed_by_di("Xbox Wireless Controller", false));
-        assert!(is_claimed_by_di("Logitech G29 Driving Force Racing Wheel", true));
-        assert!(is_claimed_by_di("HORI Racing Wheel APEX", false));
-        assert!(is_claimed_by_di("G920 Driving Force Racing Wheel for Xbox One", true));
-    }
 
     #[test]
     fn a_stick_leaves_its_dead_zone_from_nothing() {
@@ -1879,6 +1901,33 @@ mod tests {
             v = smooth_toward(v, if i % 2 == 0 { 0.23 } else { 0.17 }, 1.0 / 60.0, 0.12);
         }
         assert!((v - 0.2).abs() < 0.01, "{v}");
+    }
+
+    #[test]
+    fn names() {
+        assert!(super::names_match("Logitech G25 Racing Wheel USB", "Logitech G25 Racing Wheel"));
+        assert!(!super::names_match("", "x"));
+        assert!(super::names_match("Кнопочная панель", "кнопочная  панель"));
+        assert!(!super::names_match("Кнопочная панель", "Руль"));
+    }
+
+    #[test]
+    fn an_xbox_named_ff_wheel_stays_visible_in_the_launcher() {
+        assert!(super::include_direct_input_device("G920 Driving Force Racing Wheel for Xbox One", true, true));
+        assert!(!super::include_direct_input_device("Controller (Xbox One)", false, true));
+    }
+
+    #[test]
+    fn xbox_gamepad_with_direct_input_twin_is_not_claimed_by_direct_input() {
+        let xinput_pads = true;
+        let is_claimed_by_di = |name: &str, ff_capable: bool| {
+            super::include_direct_input_device(name, ff_capable, xinput_pads)
+        };
+        assert!(!is_claimed_by_di("Controller (XBOX 360 For Windows)", false));
+        assert!(!is_claimed_by_di("Xbox Wireless Controller", false));
+        assert!(is_claimed_by_di("Logitech G29 Driving Force Racing Wheel", true));
+        assert!(is_claimed_by_di("HORI Racing Wheel APEX", false));
+        assert!(is_claimed_by_di("G920 Driving Force Racing Wheel for Xbox One", true));
     }
 
     #[test]
@@ -2722,6 +2771,8 @@ mod hot_reload_tests {
             button_devices: crate::evdev_buttons::ButtonDevices::new(),
             #[cfg(windows)]
             di: None,
+            #[cfg(target_os = "macos")]
+            gc: crate::mac_game_controller::GcPads::new(),
             #[cfg(target_os = "macos")]
             hid: None,
             #[cfg(target_os = "macos")]
