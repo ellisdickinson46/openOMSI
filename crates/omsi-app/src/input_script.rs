@@ -9,7 +9,7 @@ pub(crate) fn is_game_action(name: &str) -> bool {
     name.starts_with("view_")
         || matches!(
             name.as_str(),
-            "sim_pause" | "screenshot" | "quicksave" | "toggel_mouse_ctrl" | "toggel_ctrler"
+            "sim_pause" | "open_menu" | "screenshot" | "quicksave" | "toggel_mouse_ctrl" | "toggel_ctrler"
         )
 }
 
@@ -3497,6 +3497,21 @@ impl App {
         if self.vr_action(name) { return true; }
         match name {
             "sim_pause" => self.toggle_pause(),
+            // the menu Esc opens (a controller has no Esc): pressed again, it closes the menu
+            // and whatever list it had open, as leaving them with Esc does
+            "open_menu" => {
+                if self.game_menu.is_some() || self.chooser.is_some() {
+                    self.chooser = None;
+                    self.admin_list = None;
+                    self.list_kind = None;
+                    self.dropdown = None;
+                    if self.game_menu.is_some() {
+                        self.close_game_menu();
+                    }
+                } else {
+                    self.open_game_menu();
+                }
+            }
             "screenshot" => self.take_screenshot(),
             "quicksave" => self.quick_save(),
             "view_set_ego" => {
